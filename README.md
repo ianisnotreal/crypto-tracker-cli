@@ -203,6 +203,168 @@ CoinGecko client (mock responses / 429 handling)
 
 Daemon tick (fake time; ensure lock respected)
 
+Troubleshooting: PATH & venv (Windows)
+“crypto : The term 'crypto' is not recognized…”
+
+This terminal doesn’t see the installed script.
+
+Fix A: Activate your project venv
+
+cd C:\Users\User\PycharmProjects\crypto-tracker-cli
+.\venv\Scripts\activate
+cd .\crypto-tracker-cli
+pip install -e .
+where crypto              # should show ...\venv\Scripts\crypto.exe
+crypto track
+
+
+Fix B: Run via Python directly (no PATH needed)
+
+cd C:\Users\User\PycharmProjects\crypto-tracker-cli\crypto-tracker-cli
+python cli.py track
+
+
+Fix C: Use full path to the script (global user install)
+
+& "$env:LOCALAPPDATA\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\Scripts\crypto.exe" track
+
+
+Fix D: Make it work in new terminals (add to PATH)
+
+setx PATH "$env:PATH;$env:LOCALAPPDATA\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\Scripts"
+# Close and open a NEW terminal after this
+
+“ModuleNotFoundError: No module named 'requests'”
+
+The script ran with a Python interpreter that doesn’t have deps installed.
+
+Activate venv and install:
+
+cd C:\Users\User\PycharmProjects\crypto-tracker-cli
+.\venv\Scripts\activate
+cd .\crypto-tracker-cli
+pip install -r requirements.txt  # or: pip install requests beautifulsoup4 rich apscheduler
+
+
+In PyCharm, set Project Interpreter to your venv:
+Settings → Project → Python Interpreter → select ...\venv\Scripts\python.exe.
+
+“error: Multiple top-level packages discovered…” when pip install -e .
+
+Your pyproject.toml needs explicit package discovery.
+
+Ensure your pyproject.toml has:
+
+[tool.setuptools]
+py-modules = ["cli"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "services*", "storage*", "scheduler*", "utils*"]
+
+
+And each package dir has __init__.py:
+core/, services/, storage/, scheduler/, utils/.
+
+Rich table garbled or “black lines” in terminal
+
+Update PSReadLine and open a fresh terminal:
+
+Install-Module PSReadLine -MinimumVersion 2.0.3 -Scope CurrentUser -Force
+
+Two daemons at once
+
+The second should exit with: “Another crypto daemon is already running (lock present).”
+If you crashed and the lock remains, ensure no daemon is running, then delete:
+
+C:\Users\User\.crypto_tracker\daemon.lock
+
+Price fetch fails / offline
+
+The app auto-falls back to cache.json for last prices.
+
+Try again later or run crypto daemon to refresh when connectivity returns.
+
+Release Checklist
+
+Bump version
+In pyproject.toml, update:
+
+[project]
+version = "0.1.X"
+
+
+Commit: chore: bump version to 0.1.X.
+
+Smoke test (local)
+
+# fresh venv
+python -m venv venv
+.\venv\Scripts\activate
+pip install -e .
+crypto track
+crypto price btc,eth
+crypto history --table
+crypto alert --use <if any> || crypto alert --above btc=1 --every 1
+# Ctrl+C to stop watch/daemon/alert loops
+
+
+Run basic tests (add when ready)
+
+Unit tests: portfolio math (weighted cost, P/L), JSON atomic writes, client retry/429.
+
+Integration: track with mocked API; one daemon cycle with lock file.
+
+pytest -q
+
+
+Build artifacts
+
+# from the folder with pyproject.toml
+pip install build
+python -m build
+# produces dist/*.whl and dist/*.tar.gz
+
+
+Tag the release
+
+git add .
+git commit -m "release: 0.1.X"
+git tag v0.1.X
+git push && git push --tags
+
+
+(Optional) Publish to PyPI
+
+pip install twine
+twine upload dist/*
+
+
+Make sure your package name (project.name in pyproject.toml) is unique on PyPI.
+
+Consider a scoped name if needed (e.g., yourname-crypto-tracker-cli).
+
+Update README
+
+Add new features/flags.
+
+Add an upgrade note:
+
+pip install -U crypto-tracker-cli
+
+
+Post-release sanity
+
+New venv test:
+
+python -m venv clean
+.\clean\Scripts\activate
+pip install crypto-tracker-cli
+crypto track
+
+
+Confirm crypto runs, config path is correct, and commands behave as expected.
+
 Notes & Credits
 
 Pricing via CoinGecko’s public API.
