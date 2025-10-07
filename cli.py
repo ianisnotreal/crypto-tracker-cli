@@ -1,4 +1,5 @@
 # cli.py
+import time
 import argparse
 from services.coingecko_client import get_prices
 from core.portfolio import (
@@ -6,7 +7,7 @@ from core.portfolio import (
     upsert_position, remove_qty, set_fields
 )
 from storage.json_store import (
-    append_snapshot_line, write_cache, read_config, read_cache, read_last_snapshots, write_config, ensure_config_exists
+    append_snapshot_line, write_cache, read_config, read_cache, read_last_snapshots, write_config, ensure_config_exists, read_alerts, write_alerts
 )
 from utils.timeutils import utc_now_iso
 from utils.logging import get_logger
@@ -277,6 +278,34 @@ def _parse_kv_list(pairs: list[str]) -> dict:
         out[k.strip()] = v.strip()
     return out
 
+def _parse_symbol_thresholds(items: list[str]) -> dict[str, float]:
+    """Parse key=value like btc=70000 into {'btc': 70000.0}."""
+    out: dict[str, float] = {}
+    for item in items or []:
+        if "=" not in item:
+            raise ValueError(f"Expected key=value, got '{item}'")
+        k, v = item.split("=", 1)
+        k = k.strip().lower()
+        try:
+            out[k] = float(v.strip().replace(",", ""))
+        except ValueError:
+            raise ValueError(f"Threshold for '{k}' must be a number.")
+    return out
+
+def _parse_csv_syms(s: str | None) -> list[str]:
+    if not s:
+        return []
+    return [x.strip().lower() for x in s.split(",") if x.strip()]
+
+def _resolve_many_symbols_to_ids(symbols: list[str], cfg: dict) -> list[str]:
+    ids = []
+    for s in symbols:
+        cid = cfg.get("symbols_map", {}).get(s.lower())
+        if not cid:
+            raise ValueError(f"Unknown symbol '{s}'. Add it via `crypto config --add-symbol {s}=<coingecko_id>`.")
+        ids.append(cid)
+    return ids
+
 def cmd_config(args: argparse.Namespace):
         # Always ensure there is a config file to work with
         ensure_config_exists()
@@ -340,6 +369,160 @@ def cmd_config(args: argparse.Namespace):
             import json
             print(json.dumps(cfg, indent=2, ensure_ascii=False))
 
+def cmd_alert(args: argparse.Namespace):
+    cfg = read_config()
+    vs = (args.fiat or cfg.get("vs_currency", "usd")).lower()
+
+    # Load saved sets if requested
+    saved = read_alerts()  # {"saved": {...}}
+    above = {}
+    below = {}
+
+    if args.use:
+        name = args.use.lower()
+        preset = saved["saved"].get(name)
+        if not preset:
+            print(f"No saved alert set named '{name}'. Use `crypto alert --list` to see options.")
+            return
+        vs = (preset.get("vs_currency") or vs).lower()
+        above.update(preset.get("above") or {})
+        below.update(preset.get("below") or {})
+
+    # Merge inline thresholds (CLI args win)
+    above.update(_parse_symbol_thresholds(args.above))
+    below.update(_parse_symbol_thresholds(args.below))
+
+    # List or delete saved sets and exit (no run)
+    if args.list:
+        names = sorted(saved["saved"].keys())
+        if not names:
+            print("No saved alert sets.")
+        else:
+            print("Saved alert sets:")
+            for n in names:
+                print(" -", n)
+        return
+
+    if args.delete:
+        n = args.delete.lower()
+        if n in saved["saved"]:
+            del saved["saved"][n]
+            write_alerts(saved)
+            print(f"Deleted saved set '{n}'.")
+        else:
+            print(f"No saved set named '{n}'.")
+        return
+
+    # Must have at least one threshold to run or save
+    if not above and not below:
+        print("Provide thresholds with --above/--below or use --use <name>.")
+        return
+
+    # Save current set if requested
+    if args.save:
+        name = args.save.lower()
+        saved["saved"][name] = {"vs_currency": vs, "above": above, "below": below}
+        write_alerts(saved)
+        print(f"Saved alert set '{name}'.")
+        # Note: keep running a check after saving
+
+    syms = sorted(set(list(above.keys()) + list(below.keys())))
+    ids = _resolve_many_symbols_to_ids(syms, cfg)
+
+    def check_once():
+        prices = get_prices(ids, vs_currency=vs)
+        triggered = []
+        for s, cid in zip(syms, ids):
+            p = float(prices.get(cid, {}).get(vs, 0.0))
+            if s in above and p >= above[s]:
+                triggered.append((s, p, f">= {above[s]:,.2f}"))
+            if s in below and p <= below[s]:
+                triggered.append((s, p, f"<= {below[s]:,.2f}"))
+        if triggered:
+            for (s, p, cond) in triggered:
+                print(f"\aALERT {s.upper():<5} ${p:,.2f}  (hit {cond})")
+        else:
+            print("No alerts triggered.")
+        return triggered
+
+    if args.every:
+        try:
+            import time
+            print(f"Watching every {args.every}s (Ctrl+C to stop). Fiat={vs.upper()}")
+            while True:
+                _ = check_once()
+                time.sleep(args.every)
+        except KeyboardInterrupt:
+            print("\nStopped.")
+    else:
+        check_once()
+
+def cmd_watch(args: argparse.Namespace):
+    # Which coins to show?
+    cfg = read_config()
+    vs = (args.fiat or cfg.get("vs_currency", "usd")).lower()
+
+    # If user passed symbols, resolve them; else use portfolio coins.
+    syms = _parse_csv_syms(args.symbols)
+    if syms:
+        ids = _resolve_many_symbols_to_ids(syms, cfg)
+    else:
+        port = load_portfolio()
+        syms = [p["symbol"].lower() for p in port.get("positions", [])]
+        ids  = [p["id"] for p in port.get("positions", [])]
+        if not ids:
+            print("No positions and no --symbols provided. Try: crypto watch --symbols btc,eth")
+            return
+
+    # Optional alert thresholds
+    above = _parse_symbol_thresholds(args.above)
+    below = _parse_symbol_thresholds(args.below)
+
+    # Lazy import rich (fallback to plain loop if unavailable)
+    try:
+        from rich.console import Console
+        from rich.table import Table
+        from rich.live import Live
+        console = Console()
+
+        def render_table(prices_dict: dict[str, float]) -> Table:
+            t = Table(title=f"Crypto Watch  (fiat={vs.upper()}, refresh={args.every}s)")
+            t.add_column("Symbol", justify="left")
+            t.add_column("Price", justify="right")
+            t.add_column("Alert", justify="left")
+            for s, cid in zip(syms, ids):
+                p = float(prices_dict.get(cid, 0.0))
+                alert_txt = ""
+                if s in above and p >= above[s]:
+                    alert_txt = f"[bold green]>= {above[s]:,.2f}[/bold green]"
+                elif s in below and p <= below[s]:
+                    alert_txt = f"[bold red]<= {below[s]:,.2f}[/bold red]"
+                t.add_row(s.upper(), f"${p:,.2f}", alert_txt)
+            return t
+
+        with Live(console=console, refresh_per_second=max(1, int(10/args.every))):
+            while True:
+                prices_resp = get_prices(ids, vs_currency=vs)
+                flat = {cid: prices_resp.get(cid, {}).get(vs, 0.0) for cid in ids}
+                console.print(render_table(flat), justify="left")
+                time.sleep(args.every)
+    except Exception:
+        # Plain fallback (prints each tick)
+        print(f"(plain mode) Refreshing every {args.every}s; fiat={vs.upper()}. Press Ctrl+C to stop.")
+        try:
+            while True:
+                prices_resp = get_prices(ids, vs_currency=vs)
+                for s, cid in zip(syms, ids):
+                    p = prices_resp.get(cid, {}).get(vs, 0.0)
+                    tag = ""
+                    if s in above and p >= above[s]: tag = f"  ALERT >= {above[s]:,.2f}"
+                    if s in below and p <= below[s]: tag = f"  ALERT <= {below[s]:,.2f}"
+                    print(f"{s.upper():<6} ${p:>12,.2f}{tag}")
+                print("-" * 40)
+                time.sleep(args.every)
+        except KeyboardInterrupt:
+            print("\nStopped.")
+
 
 # -------- Parser --------
 
@@ -402,7 +585,25 @@ def build_parser():
     p_cfg.add_argument("--path", action="store_true", help="Print the config file path and exit")
     p_cfg.set_defaults(func=cmd_config)
 
+    p_alert = sub.add_parser("alert", help="Check/watch price alerts")
+    p_alert.add_argument("--above", nargs="*", help="Symbol thresholds like btc=70000 eth=5000")
+    p_alert.add_argument("--below", nargs="*", help="Symbol thresholds like btc=60000 eth=3000")
+    p_alert.add_argument("--every", type=int, help="Poll every N seconds (omit for one-shot)")
+    p_alert.add_argument("--fiat", help="Fiat currency (default from config)")
+    # saved sets
+    p_alert.add_argument("--save", help="Save the provided thresholds under a name")
+    p_alert.add_argument("--use", help="Use a saved threshold set by name")
+    p_alert.add_argument("--list", action="store_true", help="List saved alert sets")
+    p_alert.add_argument("--delete", help="Delete a saved alert set by name")
+    p_alert.set_defaults(func=cmd_alert)
 
+    p_watch = sub.add_parser("watch", help="Live-updating price table")
+    p_watch.add_argument("--symbols", help="Comma-separated symbols (default: your portfolio), e.g., btc,eth,ada")
+    p_watch.add_argument("--every", type=int, default=5, help="Refresh interval in seconds (default 5)")
+    p_watch.add_argument("--fiat", help="Fiat currency (default from config)")
+    p_watch.add_argument("--above", nargs="*", help="Alert thresholds like btc=70000 eth=5000")
+    p_watch.add_argument("--below", nargs="*", help="Alert thresholds like btc=60000 eth=3000")
+    p_watch.set_defaults(func=cmd_watch)
 
     return p
 

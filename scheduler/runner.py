@@ -6,6 +6,9 @@ from typing import Callable
 
 from utils.logging import get_logger
 
+from utils.lock import SingleInstanceLock
+
+
 log = get_logger("scheduler")
 
 class _StopFlag:
@@ -16,34 +19,36 @@ def _handle_sig(signum, frame):
     _StopFlag.stop = True
 
 def run_daemon(job_fn: Callable[[], None], interval_sec: int = 600, jitter_sec: int = 30):
-    """
-    job_fn: no-arg function that performs one full fetch+compute+persist cycle.
-    interval_sec: base interval between runs.
-    jitter_sec: +/- random jitter added to each sleep.
-    """
-    signal.signal(signal.SIGINT, _handle_sig)
-    signal.signal(signal.SIGTERM, _handle_sig)
+    lock = SingleInstanceLock()
+    if not lock.acquire():
+        log.error("Another crypto daemon is already running (lock present). Exiting.")
+        return
 
-    log.info("Daemon started. Interval=%ss, Jitter=±%ss", interval_sec, jitter_sec)
-    while not _StopFlag.stop:
-        start = time.time()
-        try:
-            job_fn()
-            log.info("Cycle complete.")
-        except Exception as e:
-            log.exception("Cycle failed: %s", e)
+    try:
+        signal.signal(signal.SIGINT, _handle_sig)
+        signal.signal(signal.SIGTERM, _handle_sig)
 
-        # Compute next sleep with jitter
-        base_sleep = max(1, interval_sec - int(time.time() - start))
-        jitter = random.randint(-jitter_sec, jitter_sec) if jitter_sec > 0 else 0
-        sleep_for = max(1, base_sleep + jitter)
-        log.info("Next run in %ss", sleep_for)
+        log.info("Daemon started. Interval=%ss, Jitter=±%ss", interval_sec, jitter_sec)
+        while not _StopFlag.stop:
+            start = time.time()
+            try:
+                job_fn()
+                log.info("Cycle complete.")
+            except Exception as e:
+                log.exception("Cycle failed: %s", e)
 
-        # Sleep in small chunks so we can respond to Ctrl+C quickly
-        slept = 0
-        while slept < sleep_for and not _StopFlag.stop:
-            chunk = min(1, sleep_for - slept)
-            time.sleep(chunk)
-            slept += chunk
+            base_sleep = max(1, interval_sec - int(time.time() - start))
+            jitter = random.randint(-jitter_sec, jitter_sec) if jitter_sec > 0 else 0
+            sleep_for = max(1, base_sleep + jitter)
+            log.info("Next run in %ss", sleep_for)
 
-    log.info("Daemon stopped.")
+            slept = 0
+            while slept < sleep_for and not _StopFlag.stop:
+                chunk = min(1, sleep_for - slept)
+                time.sleep(chunk)
+                slept += chunk
+
+        log.info("Daemon stopped.")
+    finally:
+        lock.release()
+

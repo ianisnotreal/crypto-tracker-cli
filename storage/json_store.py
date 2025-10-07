@@ -94,3 +94,12 @@ def ensure_config_exists():
     """Create config.json with defaults if missing."""
     if not os.path.exists(CONFIG_PATH):
         write_config(DEFAULT_CONFIG.copy())
+
+# ---- Alerts (optional persistence) ----
+ALERTS_PATH = os.path.join(HOME_DIR, "alerts.json")
+
+def read_alerts():
+    return read_json(ALERTS_PATH, {"saved": {}})
+
+def write_alerts(data: dict):
+    write_json(ALERTS_PATH, data)
