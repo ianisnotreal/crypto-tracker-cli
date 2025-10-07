@@ -71,3 +71,26 @@ def read_last_snapshots(n: int = 10):
                 continue
             out.append(json.loads(line))
     return out[-n:]
+
+# ---- Config helpers ----
+
+DEFAULT_CONFIG = {
+    "vs_currency": "usd",
+    "update_interval_sec": 600,
+    "symbols_map": {"btc": "bitcoin", "eth": "ethereum", "ada": "cardano"}
+}
+
+def write_config(cfg: dict):
+    """Atomic write of config.json."""
+    # keep only known top-level keys; ignore accidental extras
+    clean = {
+        "vs_currency": cfg.get("vs_currency", DEFAULT_CONFIG["vs_currency"]),
+        "update_interval_sec": int(cfg.get("update_interval_sec", DEFAULT_CONFIG["update_interval_sec"])),
+        "symbols_map": dict(cfg.get("symbols_map", DEFAULT_CONFIG["symbols_map"]))
+    }
+    write_json(CONFIG_PATH, clean)
+
+def ensure_config_exists():
+    """Create config.json with defaults if missing."""
+    if not os.path.exists(CONFIG_PATH):
+        write_config(DEFAULT_CONFIG.copy())
