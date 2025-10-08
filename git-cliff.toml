@@ -1,0 +1,44 @@
+# git-cliff configuration
+# Uses Conventional Commit style; adjust scopes/types as you like.
+
+[changelog]
+# group commits by type with a nice order
+header = """
+# ?? Changelog
+
+All notable changes to this project will be documented here.
+"""
+body = """
+{% if version %}## [{{ version }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}## [Unreleased]{% endif %}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {{ commit.message | upper_first }}{% if commit.breaking %} **(BREAKING)**{% endif %}{% if commit.scope %} _(scope: {{ commit.scope }})_{% endif %}
+{% endfor %}
+{% endfor %}
+"""
+footer = """
+
+"""
+
+# How to group commit types
+[git]
+conventional_commits = true
+filter_unconventional = true
+protect_breaking_commits = true
+commit_parsers = [
+  { message = "^feat", group = "Added" },
+  { message = "^fix",  group = "Fixed" },
+  { message = "^perf", group = "Performance" },
+  { message = "^refactor", group = "Refactored" },
+  { message = "^docs", group = "Docs" },
+  { message = "^test", group = "Tests" },
+  { message = "^ci",   group = "CI" },
+  { message = "^build", group = "Build" },
+  { message = "^chore", group = "Chore" },
+  { message = "^style", group = "Style" }
+]
+
+# Tag pattern (matches v0.2.0 etc.)
+tag_pattern = "v[0-9]+\\.[0-9]+\\.[0-9]+"

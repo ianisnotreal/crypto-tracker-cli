@@ -1,0 +1,49 @@
+name: Changelog & Release Notes
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write   # needed to commit CHANGELOG.md and create release
+
+jobs:
+  changelog:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # we need full history for changelog
+
+      - name: Generate release notes (git-cliff)
+        id: cliff
+        uses: orhun/git-cliff-action@v3
+        with:
+          config: git-cliff.toml
+          args: --verbose --tag ${{ github.ref_name }}
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+
+      - name: Update CHANGELOG.md (prepend)
+        run: |
+          # Prepend new notes to CHANGELOG.md, keeping existing content
+          echo "${{ steps.cliff.outputs.changelog }}" > NEW_NOTES.md
+          if [ -f CHANGELOG.md ]; then
+            cat CHANGELOG.md >> NEW_NOTES.md
+          fi
+          mv NEW_NOTES.md CHANGELOG.md
+
+      - name: Commit CHANGELOG.md
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "docs(changelog): update for ${{ github.ref_name }}"
+          file_pattern: CHANGELOG.md
+
+      - name: Create GitHub Release with notes
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          body: ${{ steps.cliff.outputs.changelog }}
