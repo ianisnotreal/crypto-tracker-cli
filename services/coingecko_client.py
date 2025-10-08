@@ -1,11 +1,45 @@
 # services/coingecko_client.py
 import time
 import logging
-import requests  # keep as module import so tests can monkeypatch requests.get
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import requests  # keep module import so tests can monkeypatch requests.get
 
 log = logging.getLogger("coingecko")
 
 COINGECKO_SIMPLE_PRICE = "https://api.coingecko.com/api/v3/simple/price"
+
+
+def _parse_retry_after(value: str | None) -> float:
+    """
+    Parse an HTTP Retry-After header value.
+
+    Accepts either:
+      - a number of seconds (e.g., "5")
+      - an HTTP-date (RFC 7231 / RFC 1123), e.g., "Wed, 21 Oct 2015 07:28:00 GMT"
+
+    Returns a non-negative float number of seconds until retry.
+    """
+    if not value:
+        return 0.0
+    value = value.strip()
+    # Numeric seconds
+    try:
+        secs = float(value)
+        return max(0.0, secs)
+    except ValueError:
+        pass
+
+    # HTTP-date
+    try:
+        dt = parsedate_to_datetime(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        delta = (dt - now).total_seconds()
+        return max(0.0, float(delta))
+    except Exception:
+        return 0.0
 
 
 def get_prices(ids, vs_currency: str = "usd", timeout: int = 10) -> dict:
@@ -14,7 +48,7 @@ def get_prices(ids, vs_currency: str = "usd", timeout: int = 10) -> dict:
 
     - Accepts a list/tuple or comma-separated string of ids.
     - Returns {id: {vs_currency: price}}
-    - Retries once on HTTP 429, honoring Retry-After header (seconds).
+    - Retries once on HTTP 429, honoring Retry-After header (seconds or HTTP-date).
     """
     if isinstance(ids, (list, tuple)):
         ids_param = ",".join(str(x) for x in ids)
@@ -31,11 +65,7 @@ def get_prices(ids, vs_currency: str = "usd", timeout: int = 10) -> dict:
     resp = requests.get(COINGECKO_SIMPLE_PRICE, params=params, timeout=timeout)
 
     if resp.status_code == 429:
-        retry_after = resp.headers.get("Retry-After", "0")
-        try:
-            delay = max(0.0, float(retry_after))
-        except ValueError:
-            delay = 0.0
+        delay = _parse_retry_after(resp.headers.get("Retry-After"))
         if delay > 0:
             time.sleep(delay)
         # retry once
