@@ -7,11 +7,12 @@ from core.portfolio import (
     upsert_position, remove_qty, set_fields
 )
 from storage.json_store import (
-    append_snapshot_line, write_cache, read_config, read_cache, read_last_snapshots, write_config, ensure_config_exists, read_alerts, write_alerts
+    append_snapshot_line, write_cache, read_config, read_cache, read_last_snapshots, write_config, ensure_config_exists, read_alerts, write_alerts, rebuild_daily_rollups, read_last_daily
 )
 from utils.timeutils import utc_now_iso
 from utils.logging import get_logger
 from scheduler.runner import run_daemon
+from statistics import mean, pstdev
 
 log = get_logger("cli")
 
@@ -185,6 +186,46 @@ def cmd_price(args: argparse.Namespace):
         print(f"{s.upper():<6} ${p:,.4f}")
 
 def cmd_history(args: argparse.Namespace):
+    if args.daily:
+        rows = read_last_daily(args.last)
+        if not rows:
+            print("No daily rollups yet. Try `crypto rollup --rebuild` or run `crypto track` a few times.")
+            return
+        if args.table:
+            try:
+                from rich.table import Table
+                from rich.console import Console
+                t = Table(title=f"Last {len(rows)} daily rollups")
+                t.add_column("Date", justify="left")
+                t.add_column("Open", justify="right")
+                t.add_column("Close", justify="right")
+                t.add_column("High", justify="right")
+                t.add_column("Low", justify="right")
+                t.add_column("Avg", justify="right")
+                t.add_column("Count", justify="right")
+                for r in rows:
+                    t.add_row(
+                        r["date"],
+                        f"${r['open']:,.2f}",
+                        f"${r['close']:,.2f}",
+                        f"${r['high']:,.2f}",
+                        f"${r['low']:,.2f}",
+                        f"${r['avg']:,.2f}",
+                        str(r["count"]),
+                    )
+                Console().print(t)
+            except Exception:
+                for r in rows:
+                    print(f"{r['date']}  O:{r['open']:,.2f}  C:{r['close']:,.2f}  H:{r['high']:,.2f}  L:{r['low']:,.2f}  Avg:{r['avg']:,.2f}  n={r['count']}")
+        else:
+            print(f"Last {len(rows)} daily rollups:")
+            for r in rows:
+                print(f"{r['date']}  O:{r['open']:,.2f}  C:{r['close']:,.2f}  H:{r['high']:,.2f}  L:{r['low']:,.2f}  Avg:{r['avg']:,.2f}  n={r['count']}")
+        return
+
+
+
+    # --- existing intra-day history path ---
     rows = read_last_snapshots(args.last)
     if not rows:
         print("No snapshots yet. Run `crypto track` or start the daemon.")
@@ -228,37 +269,6 @@ def cmd_history(args: argparse.Namespace):
                 delta = f"  Δ {diff:+,.2f} ({pct:+.2f}%)"
             print(f"{r['ts']}  total={total:,.2f} {r.get('vs_currency','usd').upper()}{delta}")
             prev = total
-def cmd_export(args: argparse.Namespace):
-    import csv, os
-    rows = read_last_snapshots(args.last)
-    if not rows:
-        print("No snapshots to export. Run `crypto track` first.")
-        return
-
-    # Collect union of coin ids across snapshots
-    coin_ids = set()
-    for r in rows:
-        for cid in (r.get("prices") or {}).keys():
-            coin_ids.add(cid)
-    coin_ids = sorted(coin_ids)
-
-    header = ["ts", "vs_currency", "total_value"] + coin_ids
-    out_path = os.path.abspath(args.out)
-
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(header)
-        for r in rows:
-            vs = (r.get("vs_currency") or "usd").lower()
-            total = float(r.get("total_value", 0.0))
-            row = [r.get("ts", ""), vs, f"{total:.2f}"]
-            prices = r.get("prices") or {}
-            for cid in coin_ids:
-                val = prices.get(cid)
-                row.append("" if val is None else f"{float(val):.6f}")
-            w.writerow(row)
-
-    print(f"Exported {len(rows)} snapshots → {out_path}")
 
     def _parse_kv_list(pairs: list[str]) -> dict:
         out = {}
@@ -523,6 +533,208 @@ def cmd_watch(args: argparse.Namespace):
         except KeyboardInterrupt:
             print("\nStopped.")
 
+def cmd_rollup(args: argparse.Namespace):
+    res = rebuild_daily_rollups()
+    print(f"Rebuilt daily rollups from {res['snapshots']} snapshots into {res['days']} day(s).")
+
+def cmd_export(args: argparse.Namespace):
+    import csv, os
+    rows = read_last_snapshots(args.last)
+    if not rows:
+        print("No snapshots to export. Run `crypto track` first.")
+        return
+
+    # Collect union of coin ids across snapshots so columns are stable
+    coin_ids = set()
+    for r in rows:
+        for cid in (r.get("prices") or {}).keys():
+            coin_ids.add(cid)
+    coin_ids = sorted(coin_ids)
+
+    header = ["ts", "vs_currency", "total_value"] + coin_ids
+    out_path = os.path.abspath(args.out)
+
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        for r in rows:
+            vs = (r.get("vs_currency") or "usd").lower()
+            total = float(r.get("total_value", 0.0))
+            row = [r.get("ts", ""), vs, f"{total:.2f}"]
+            prices = r.get("prices") or {}
+            for cid in coin_ids:
+                val = prices.get(cid)
+                row.append("" if val is None else f"{float(val):.6f}")
+            w.writerow(row)
+
+    print(f"Exported {len(rows)} snapshots → {out_path}")
+
+def _daily_pct_changes(days: list[dict]) -> list[float]:
+    """
+    Compute day-over-day % change using Close prices.
+    days: [{date, open, close, ...}] assumed in chronological order.
+    Returns list of floats in percent (e.g., 1.23 for +1.23%).
+    """
+    if len(days) < 2:
+        return []
+    rets = []
+    prev = float(days[0]["close"])
+    for d in days[1:]:
+        cur = float(d["close"])
+        if prev > 0:
+            rets.append((cur / prev - 1.0) * 100.0)
+        prev = cur
+    return rets
+
+def cmd_stats(args: argparse.Namespace):
+    # Ensure daily rollups exist/up-to-date
+    rebuild_daily_rollups()
+
+    # Load daily rows: either last N or "all" by asking for a very large N
+    N = (10**9) if args.all else max(2, int(args.last or 120))
+    days = read_last_daily(N)
+    if len(days) < 2:
+        print("Not enough daily data yet. Run `crypto track` a few times or start the daemon.")
+        return
+
+    # Ensure chronological order (read_last_daily returns tail in order)
+    # So days[0] is earliest among the returned tail; fine to use directly.
+
+    # Core series
+    opens  = [float(d["open"])  for d in days]
+    closes = [float(d["close"]) for d in days]
+
+    period_days = len(days)
+    first_val = opens[0] if opens[0] > 0 else closes[0]
+    last_val  = closes[-1]
+
+    # Daily % changes from close-to-close (in percent)
+    rets = _daily_pct_changes(days)
+
+    total_return_pct = ((last_val / first_val) - 1.0) * 100.0 if first_val else 0.0
+    avg_daily_pct = mean(rets) if rets else 0.0
+    vol_daily_pct = pstdev(rets) if len(rets) > 1 else 0.0
+
+    # Best / worst
+    if rets:
+        best_val  = max(rets)
+        worst_val = min(rets)
+        # find the dates for those best/worst closes (compare rets[i] corresponds to days[i+1])
+        best_idx  = rets.index(best_val) + 1
+        worst_idx = rets.index(worst_val) + 1
+        best_day_date  = days[best_idx]["date"]
+        worst_day_date = days[worst_idx]["date"]
+    else:
+        best_val = worst_val = 0.0
+        best_day_date = worst_day_date = days[-1]["date"]
+
+    # Sharpe-like ratio (daily): mean / stdev (if stdev>0). Annualize by sqrt(252).
+    sharpe_daily = None
+    sharpe_annual = None
+    if len(rets) >= 2:
+        vol = pstdev(rets)
+        if vol > 0:
+            sharpe_daily = mean(rets) / vol
+            sharpe_annual = sharpe_daily * (252 ** 0.5)
+
+    # Max drawdown from close series (in percent, negative)
+    max_dd_pct = _max_drawdown(closes)
+    # Optional CSV export of daily returns (date, close, ret_pct, cum_pct)
+    if getattr(args, "csv", None):
+        import csv, os
+        out_path = os.path.abspath(args.csv)
+        # rets[i] corresponds to days[i+1]; for the first day, set ret as ""
+        cum = _cum_return_series(closes)
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["date", "close", "daily_return_pct", "cum_return_pct"])
+            for i, d in enumerate(days):
+                ret = "" if i == 0 else f"{rets[i-1]:.6f}"
+                w.writerow([d["date"], f"{closes[i]:.2f}", ret, f"{cum[i]:.6f}"])
+        print(f"Exported daily returns → {out_path}")
+
+    # Optional CAGR-ish metric (calendar days between first and last)
+    from datetime import datetime
+    fmt = "%Y-%m-%d"
+    try:
+        d0 = datetime.strptime(days[0]["date"], fmt)
+        d1 = datetime.strptime(days[-1]["date"], fmt)
+        elapsed_days = max(1, (d1 - d0).days)
+    except Exception:
+        elapsed_days = period_days
+    # Annualize only if we have a meaningful window (>= 30 days)
+    cagr = None
+    if first_val > 0 and elapsed_days >= 30:
+        cagr = ((last_val / first_val) ** (365.0 / elapsed_days) - 1.0) * 100.0
+
+    # Pretty output with Rich; fall back to plain
+    try:
+        from rich.console import Console
+        from rich.table import Table
+        from rich.panel import Panel
+
+        console = Console()
+        hdr = f"Crypto Stats — {'ALL' if args.all else f'last {period_days} day(s)'}"
+        t = Table(title=hdr)
+        t.add_column("Metric", justify="left")
+        t.add_column("Value", justify="right")
+
+        t.add_row("Days",               str(period_days))
+        t.add_row("Start Value",        f"${first_val:,.2f}")
+        t.add_row("End Value",          f"${last_val:,.2f}")
+        t.add_row("Total Return",       f"{total_return_pct:+.2f}%")
+        t.add_row("Avg Daily Return",   f"{avg_daily_pct:+.3f}%")
+        t.add_row("Daily Volatility",   f"{vol_daily_pct:.3f}% (stdev)")
+        t.add_row("Best Day",           f"{best_day_date}  ({best_val:+.2f}%)")
+        t.add_row("Worst Day",          f"{worst_day_date} ({worst_val:+.2f}%)")
+        t.add_row("CAGR (approx.)", f"{(cagr if cagr is not None else float('nan')):+.2f}%"
+        if cagr is not None else "N/A")
+        t.add_row("Sharpe (daily)",      f"{(sharpe_daily if sharpe_daily is not None else float('nan')):.3f}" if sharpe_daily is not None else "N/A")
+        t.add_row("Sharpe (annualized)", f"{(sharpe_annual if sharpe_annual is not None else float('nan')):.3f}" if sharpe_annual is not None else "N/A")
+        t.add_row("Max Drawdown",        f"{max_dd_pct:.2f}%")
+
+        console.print(t)
+    except Exception:
+        print(f"Days: {period_days}")
+        print(f"Start Value: ${first_val:,.2f}")
+        print(f"End Value:   ${last_val:,.2f}")
+        print(f"Total Return: {total_return_pct:+.2f}%")
+        print(f"Avg Daily Return: {avg_daily_pct:+.3f}%")
+        print(f"Daily Volatility: {vol_daily_pct:.3f}% (stdev)")
+        print(f"Best Day:  {best_day_date}  ({best_val:+.2f}%)")
+        print(f"Worst Day: {worst_day_date} ({worst_val:+.2f}%)")
+        print(f"CAGR (approx.): {(f'{cagr:+.2f}%' if cagr is not None else 'N/A')}")
+        print(f"Sharpe (daily): {(f'{sharpe_daily:.3f}' if sharpe_daily is not None else 'N/A')}")
+        print(f"Sharpe (annualized): {(f'{sharpe_annual:.3f}' if sharpe_annual is not None else 'N/A')}")
+        print(f"Max Drawdown: {max_dd_pct:.2f}%")
+
+
+def _max_drawdown(closes: list[float]) -> float:
+    """
+    Returns max drawdown in percent (negative number), based on closing values.
+    """
+    max_peak = closes[0] if closes else 0.0
+    max_dd = 0.0
+    for c in closes:
+        if c > max_peak:
+            max_peak = c
+        if max_peak > 0:
+            dd = (c / max_peak - 1.0) * 100.0
+            if dd < max_dd:
+                max_dd = dd
+    return max_dd  # e.g., -23.4 (%)
+
+def _cum_return_series(closes: list[float]) -> list[float]:
+    """
+    Cumulative return (in %) from the first close.
+    """
+    if not closes or closes[0] <= 0:
+        return [0.0] * len(closes)
+    base = closes[0]
+    return [((c / base) - 1.0) * 100.0 for c in closes]
+
+
+
 
 # -------- Parser --------
 
@@ -567,9 +779,10 @@ def build_parser():
     p_price.add_argument("--fiat", help="Fiat currency (default from config.json)")
     p_price.set_defaults(func=cmd_price)
 
-    p_hist = sub.add_parser("history", help="Show last N snapshots")
+    p_hist = sub.add_parser("history", help="Show last N snapshots (or daily rollups)")
     p_hist.add_argument("--last", type=int, default=10, help="How many lines to show (default 10)")
     p_hist.add_argument("--table", action="store_true", help="Pretty table output")
+    p_hist.add_argument("--daily", action="store_true", help="Show daily rollups instead of raw snapshots")
     p_hist.set_defaults(func=cmd_history)
 
     p_exp = sub.add_parser("export", help="Export last N snapshots to CSV")
@@ -604,6 +817,16 @@ def build_parser():
     p_watch.add_argument("--above", nargs="*", help="Alert thresholds like btc=70000 eth=5000")
     p_watch.add_argument("--below", nargs="*", help="Alert thresholds like btc=60000 eth=3000")
     p_watch.set_defaults(func=cmd_watch)
+
+    p_roll = sub.add_parser("rollup", help="Rebuild daily rollups from all snapshots")
+    p_roll.set_defaults(func=cmd_rollup)
+
+    p_stats = sub.add_parser("stats", help="Show performance statistics from daily rollups")
+    p_stats.add_argument("--last", type=int, help="Use last N days (default 120)")
+    p_stats.add_argument("--all", action="store_true", help="Use all available days")
+    p_stats.add_argument("--csv", help="Export daily returns to CSV at this path")
+    p_stats.set_defaults(func=cmd_stats)
+
 
     return p
 

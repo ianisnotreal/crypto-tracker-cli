@@ -35,3 +35,15 @@ def test_get_prices_429_then_success(monkeypatch):
     data = cg.get_prices(["bitcoin"], "usd")
     assert calls["n"] >= 2
     assert data["bitcoin"]["usd"] == 50000
+
+from services import coingecko_client as cg
+from datetime import datetime, timezone, timedelta
+
+def test_parse_retry_after_numeric():
+    assert cg._parse_retry_after("5") >= 5.0
+
+def test_parse_retry_after_date():
+    # 2 seconds in the future
+    future = (datetime.now(timezone.utc) + timedelta(seconds=2)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    val = cg._parse_retry_after(future)
+    assert 0.5 <= val <= 2.5  # within a loose window

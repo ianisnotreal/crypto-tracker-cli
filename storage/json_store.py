@@ -103,3 +103,95 @@ def read_alerts():
 
 def write_alerts(data: dict):
     write_json(ALERTS_PATH, data)
+
+# ---- Daily rollups ----
+from datetime import datetime, timezone
+SNAPSHOTS_DAY_PATH = os.path.join(HOME_DIR, "snapshots_day.jsonl")
+
+def _date_utc(ts_iso: str) -> str:
+    # ts like "2025-10-08T15:22:01.123456+00:00" -> "2025-10-08"
+    try:
+        dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+    except Exception:
+        # fallback: treat unknown as UTC now, but avoid crash
+        dt = datetime.now(timezone.utc)
+    return dt.astimezone(timezone.utc).date().isoformat()
+
+def rebuild_daily_rollups():
+    """Rebuild snapshots_day.jsonl from snapshots.jsonl (idempotent)."""
+    ensure_home()
+    if not os.path.exists(SNAPSHOTS_PATH):
+        # nothing to do
+        _atomic_write_text(SNAPSHOTS_DAY_PATH, "")
+        return {"days": 0, "snapshots": 0}
+
+    # Aggregate in-memory per date
+    per_day = {}  # date -> dict
+    total_snapshots = 0
+    with open(SNAPSHOTS_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            total_snapshots += 1
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            d = _date_utc(row.get("ts", ""))
+            total = float(row.get("total_value", 0.0))
+            rec = per_day.get(d)
+            if rec is None:
+                rec = {
+                    "date": d,
+                    "open": total,
+                    "close": total,
+                    "high": total,
+                    "low": total,
+                    "sum": total,
+                    "count": 1,
+                }
+                per_day[d] = rec
+            else:
+                # update OHLC + average
+                rec["close"] = total
+                rec["high"] = max(rec["high"], total)
+                rec["low"] = min(rec["low"], total)
+                rec["sum"] += total
+                rec["count"] += 1
+
+    # Write out as jsonl in date order
+    days_sorted = sorted(per_day.keys())
+    lines = []
+    for d in days_sorted:
+        rec = per_day[d]
+        avg = rec["sum"] / rec["count"] if rec["count"] else rec["close"]
+        lines.append(json.dumps({
+            "date": rec["date"],
+            "open": rec["open"],
+            "close": rec["close"],
+            "high": rec["high"],
+            "low": rec["low"],
+            "avg": avg,
+            "count": rec["count"],
+        }, ensure_ascii=False))
+
+    _atomic_write_text(SNAPSHOTS_DAY_PATH, "\n".join(lines) + ("\n" if lines else ""))
+    return {"days": len(days_sorted), "snapshots": total_snapshots}
+
+def read_last_daily(n: int = 14):
+    """Tail the daily rollups file (rebuild first if missing/empty)."""
+    ensure_home()
+    if not os.path.exists(SNAPSHOTS_DAY_PATH):
+        # lazy build once
+        rebuild_daily_rollups()
+    if not os.path.exists(SNAPSHOTS_DAY_PATH):
+        return []
+    out = []
+    with open(SNAPSHOTS_DAY_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            out.append(json.loads(line))
+    return out[-n:]
