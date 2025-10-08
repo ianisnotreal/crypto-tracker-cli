@@ -1,6 +1,7 @@
 import logging
-from logging.handlers import RotatingFileHandler
 import os
+from logging.handlers import RotatingFileHandler
+
 
 def get_logger(name="crypto"):
     os.makedirs(os.path.expanduser("~/.crypto_tracker"), exist_ok=True)

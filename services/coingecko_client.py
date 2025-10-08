@@ -1,8 +1,9 @@
 # services/coingecko_client.py
-import time
 import logging
+import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+
 import requests  # keep module import so tests can monkeypatch requests.get
 
 log = logging.getLogger("coingecko")
@@ -76,8 +77,42 @@ def get_prices(ids, vs_currency: str = "usd", timeout: int = 10) -> dict:
 
     if status != 200:
         log.warning("Fetch failed in %.1f ms (status %s).", elapsed_ms, status)
+
+        # --- Fallback to HTML scraper before raising ---
+        # --- Fallback to HTML scraper before raising (writes cache) ---
+        try:
+            if str(vs_currency).lower() == "usd":
+                from services.html_fallback import get_prices_html
+                from storage.json_store import write_cache  # <-- added import
+
+                alt = get_prices_html(ids)
+                if alt:
+                    log.warning("Using HTML fallback for %d id(s).", len(alt))
+
+                    # Persist to cache so offline mode & future runs have a last-known price set
+                    try:
+                        from datetime import datetime, timezone
+                        cache_obj = {
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "vs_currency": "usd",
+                            # flatten: {"bitcoin": 12345.67, ...}
+                            "prices": {k: v.get("usd") for k, v in alt.items()},
+                        }
+                        write_cache(cache_obj)
+                    except Exception:
+                        # cache write is best-effort; do not block returning prices
+                        pass
+
+                    return alt
+        except Exception:
+            # ignore; we'll raise the original error below
+            pass
+
         resp.raise_for_status()
 
     data = resp.json()
-    log.info("Fetched %d ids in %.1f ms (status %s).", len(ids_param.split(",")), elapsed_ms, status)
+    log.info(
+        "Fetched %d ids in %.1f ms (status %s).", len(ids_param.split(",")), elapsed_ms, status
+    )
     return data
+

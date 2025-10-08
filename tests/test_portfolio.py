@@ -1,5 +1,6 @@
 from core import portfolio
 
+
 def test_upsert_new_and_existing():
     port = {"positions": []}
 
@@ -12,8 +13,9 @@ def test_upsert_new_and_existing():
     pos = port["positions"][0]
     assert round(pos["cost_basis"], 2) == 25000.00  # weighted avg of 20k + 30k
 
+
 def test_remove_qty_and_all():
-    port = {"positions": [{"id":"bitcoin","symbol":"btc","qty":2,"cost_basis":25000}]}
+    port = {"positions": [{"id": "bitcoin", "symbol": "btc", "qty": 2, "cost_basis": 25000}]}
     port = portfolio.remove_qty(port, symbol="btc", qty=1)
     assert port["positions"][0]["qty"] == 1
     port = portfolio.remove_qty(port, symbol="btc", remove_all=True)

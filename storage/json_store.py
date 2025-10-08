@@ -1,5 +1,9 @@
 # storage/json_store.py
-import json, os, tempfile, io
+import io
+import json
+import os
+import tempfile
+from datetime import datetime, timezone
 from typing import Any, Dict
 
 HOME_DIR = os.path.expanduser("~/.crypto_tracker")
@@ -8,8 +12,10 @@ SNAPSHOTS_PATH = os.path.join(HOME_DIR, "snapshots.jsonl")
 CONFIG_PATH = os.path.join(HOME_DIR, "config.json")
 PORTFOLIO_PATH = os.path.join(HOME_DIR, "portfolio.json")
 
+
 def ensure_home():
     os.makedirs(HOME_DIR, exist_ok=True)
+
 
 def _atomic_write_text(path: str, text: str):
     ensure_home()
@@ -27,8 +33,10 @@ def _atomic_write_text(path: str, text: str):
         except Exception:
             pass
 
+
 def write_json(path: str, data: Dict[str, Any]):
     _atomic_write_text(path, json.dumps(data, ensure_ascii=False))
+
 
 def read_json(path: str, default: Dict[str, Any] | None = None) -> Dict[str, Any]:
     if not os.path.exists(path):
@@ -36,27 +44,49 @@ def read_json(path: str, default: Dict[str, Any] | None = None) -> Dict[str, Any
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+
 def write_cache(last_prices: Dict[str, Any], last_fetch_ts: str):
     write_json(CACHE_PATH, {"last_prices": last_prices, "last_fetch_ts": last_fetch_ts})
+
 
 def read_cache() -> Dict[str, Any]:
     return read_json(CACHE_PATH, {"last_prices": {}, "last_fetch_ts": None})
 
-def append_snapshot_line(obj: Dict[str, Any]):
+
+def append_snapshot_line(obj: dict) -> None:
+    """Append a single JSON line to snapshots.jsonl (atomic best-effort)."""
     ensure_home()
-    with open(SNAPSHOTS_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    # write the snapshot
+    line = json.dumps(obj, ensure_ascii=False)
+    try:
+        # create parent dir
+        os.makedirs(os.path.dirname(SNAPSHOTS_PATH), exist_ok=True)
+        with open(SNAPSHOTS_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        # swallow errors to avoid crashing the caller; snapshot loss is acceptable
+        pass
+
+    # NEW: incrementally update today's daily rollup
+    try:
+        upsert_daily_from_snapshot(obj)
+    except Exception:
+        # do not fail the caller if rollup update has an issue
+        pass
+
 
 def read_config() -> Dict[str, Any]:
     # Defaults if user hasn't created config.json
     cfg = {
         "vs_currency": "usd",
         "update_interval_sec": 600,
-        "symbols_map": { "btc": "bitcoin", "eth": "ethereum", "ada": "cardano" }
+        "symbols_map": {"btc": "bitcoin", "eth": "ethereum", "ada": "cardano"},
     }
     disk = read_json(CONFIG_PATH, {})
     cfg.update(disk)
     return cfg
+
+
 def read_last_snapshots(n: int = 10):
     ensure_home()
     path = SNAPSHOTS_PATH
@@ -72,41 +102,51 @@ def read_last_snapshots(n: int = 10):
             out.append(json.loads(line))
     return out[-n:]
 
+
 # ---- Config helpers ----
 
 DEFAULT_CONFIG = {
     "vs_currency": "usd",
     "update_interval_sec": 600,
-    "symbols_map": {"btc": "bitcoin", "eth": "ethereum", "ada": "cardano"}
+    "symbols_map": {"btc": "bitcoin", "eth": "ethereum", "ada": "cardano"},
 }
+
 
 def write_config(cfg: dict):
     """Atomic write of config.json."""
     # keep only known top-level keys; ignore accidental extras
     clean = {
         "vs_currency": cfg.get("vs_currency", DEFAULT_CONFIG["vs_currency"]),
-        "update_interval_sec": int(cfg.get("update_interval_sec", DEFAULT_CONFIG["update_interval_sec"])),
-        "symbols_map": dict(cfg.get("symbols_map", DEFAULT_CONFIG["symbols_map"]))
+        "update_interval_sec": int(
+            cfg.get("update_interval_sec", DEFAULT_CONFIG["update_interval_sec"])
+        ),
+        "symbols_map": dict(cfg.get("symbols_map", DEFAULT_CONFIG["symbols_map"])),
     }
     write_json(CONFIG_PATH, clean)
+
 
 def ensure_config_exists():
     """Create config.json with defaults if missing."""
     if not os.path.exists(CONFIG_PATH):
         write_config(DEFAULT_CONFIG.copy())
 
+
 # ---- Alerts (optional persistence) ----
 ALERTS_PATH = os.path.join(HOME_DIR, "alerts.json")
+
 
 def read_alerts():
     return read_json(ALERTS_PATH, {"saved": {}})
 
+
 def write_alerts(data: dict):
     write_json(ALERTS_PATH, data)
 
+
 # ---- Daily rollups ----
-from datetime import datetime, timezone
+
 SNAPSHOTS_DAY_PATH = os.path.join(HOME_DIR, "snapshots_day.jsonl")
+
 
 def _date_utc(ts_iso: str) -> str:
     # ts like "2025-10-08T15:22:01.123456+00:00" -> "2025-10-08"
@@ -116,6 +156,84 @@ def _date_utc(ts_iso: str) -> str:
         # fallback: treat unknown as UTC now, but avoid crash
         dt = datetime.now(timezone.utc)
     return dt.astimezone(timezone.utc).date().isoformat()
+
+def _read_all_daily_records() -> list[dict]:
+    """Load all daily rollup rows from snapshots_day.jsonl (may return [])."""
+    ensure_home()
+    if not os.path.exists(SNAPSHOTS_DAY_PATH):
+        return []
+    out = []
+    with open(SNAPSHOTS_DAY_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                pass
+    return out
+
+
+def _write_all_daily_records(rows: list[dict]) -> None:
+    """Rewrite snapshots_day.jsonl with the provided rows (atomic)."""
+    lines = [json.dumps(r, ensure_ascii=False) for r in rows]
+    _atomic_write_text(SNAPSHOTS_DAY_PATH, "\n".join(lines) + ("\n" if lines else ""))
+
+
+def upsert_daily_from_snapshot(snapshot: dict) -> None:
+    """
+    Incrementally update the daily rollup for the date of `snapshot`.
+    snapshot must contain: ts (ISO-8601), total_value (float).
+    Fields maintained per-day: open, close, high, low, avg, count.
+    """
+    ensure_home()
+    # derive date + total (guard but don't crash)
+    d = _date_utc(str(snapshot.get("ts", "")))
+    try:
+        total = float(snapshot.get("total_value", 0.0))
+    except Exception:
+        total = 0.0
+
+    rows = _read_all_daily_records()
+
+    # find existing record for this date
+    idx = next((i for i, r in enumerate(rows) if r.get("date") == d), None)
+
+    if idx is None:
+        # first observation for the day
+        rec = {
+            "date": d,
+            "open": total,
+            "close": total,
+            "high": total,
+            "low": total,
+            "avg": total,
+            "count": 1,
+        }
+        rows.append(rec)
+    else:
+        rec = rows[idx]
+        # recompute fields (avg via weighted running sum)
+        cnt = int(rec.get("count", 0))
+        prev_sum = float(rec.get("avg", 0.0)) * max(cnt, 0)
+        cnt += 1
+        new_sum = prev_sum + total
+        rec.update(
+            {
+                "close": total,
+                "high": max(float(rec.get("high", total)), total),
+                "low": min(float(rec.get("low", total)), total),
+                "avg": (new_sum / cnt) if cnt else total,
+                "count": cnt,
+            }
+        )
+        rows[idx] = rec
+
+    # keep file sorted by date (ascending)
+    rows.sort(key=lambda r: r.get("date", ""))
+
+    _write_all_daily_records(rows)
 
 def rebuild_daily_rollups():
     """Rebuild snapshots_day.jsonl from snapshots.jsonl (idempotent)."""
@@ -166,18 +284,24 @@ def rebuild_daily_rollups():
     for d in days_sorted:
         rec = per_day[d]
         avg = rec["sum"] / rec["count"] if rec["count"] else rec["close"]
-        lines.append(json.dumps({
-            "date": rec["date"],
-            "open": rec["open"],
-            "close": rec["close"],
-            "high": rec["high"],
-            "low": rec["low"],
-            "avg": avg,
-            "count": rec["count"],
-        }, ensure_ascii=False))
+        lines.append(
+            json.dumps(
+                {
+                    "date": rec["date"],
+                    "open": rec["open"],
+                    "close": rec["close"],
+                    "high": rec["high"],
+                    "low": rec["low"],
+                    "avg": avg,
+                    "count": rec["count"],
+                },
+                ensure_ascii=False,
+            )
+        )
 
     _atomic_write_text(SNAPSHOTS_DAY_PATH, "\n".join(lines) + ("\n" if lines else ""))
     return {"days": len(days_sorted), "snapshots": total_snapshots}
+
 
 def read_last_daily(n: int = 14):
     """Tail the daily rollups file (rebuild first if missing/empty)."""
@@ -195,3 +319,22 @@ def read_last_daily(n: int = 14):
                 continue
             out.append(json.loads(line))
     return out[-n:]
+
+def read_daily_all() -> list[dict]:
+    """Return all daily rollup rows (chronological)."""
+    ensure_home()
+    if not os.path.exists(SNAPSHOTS_DAY_PATH):
+        return []
+    rows = []
+    with open(SNAPSHOTS_DAY_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                pass
+    rows.sort(key=lambda r: r.get("date", ""))
+    return rows
+

@@ -1,7 +1,10 @@
 # core/portfolio.py
-import os, json
+import json
+import os
 from typing import Dict, List, Optional
+
 from storage.json_store import PORTFOLIO_PATH, write_json
+
 
 def load_portfolio() -> Dict:
     """Load or initialize the portfolio file."""
@@ -10,9 +13,11 @@ def load_portfolio() -> Dict:
     with open(PORTFOLIO_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
+
 def save_portfolio(data: Dict) -> None:
     """Atomic save."""
     write_json(PORTFOLIO_PATH, data)
+
 
 def _find_index_by_symbol(port: Dict, symbol: str) -> int:
     symbol = symbol.lower()
@@ -21,7 +26,10 @@ def _find_index_by_symbol(port: Dict, symbol: str) -> int:
             return i
     return -1
 
-def upsert_position(port: Dict, *, coin_id: str, symbol: str, qty: float, cost_basis: Optional[float] = None) -> Dict:
+
+def upsert_position(
+    port: Dict, *, coin_id: str, symbol: str, qty: float, cost_basis: Optional[float] = None
+) -> Dict:
     """
     Add a new position or increase quantity.
     If the symbol exists and cost_basis is provided, re-compute a weighted average cost.
@@ -29,12 +37,14 @@ def upsert_position(port: Dict, *, coin_id: str, symbol: str, qty: float, cost_b
     assert qty > 0, "Quantity must be positive."
     idx = _find_index_by_symbol(port, symbol)
     if idx == -1:
-        port["positions"].append({
-            "id": coin_id,
-            "symbol": symbol.lower(),
-            "qty": float(qty),
-            "cost_basis": float(cost_basis if cost_basis is not None else 0.0),
-        })
+        port["positions"].append(
+            {
+                "id": coin_id,
+                "symbol": symbol.lower(),
+                "qty": float(qty),
+                "cost_basis": float(cost_basis if cost_basis is not None else 0.0),
+            }
+        )
         return port
 
     pos = port["positions"][idx]
@@ -51,7 +61,10 @@ def upsert_position(port: Dict, *, coin_id: str, symbol: str, qty: float, cost_b
     pos.update({"qty": new_qty, "cost_basis": new_cost})
     return port
 
-def remove_qty(port: Dict, *, symbol: str, qty: Optional[float] = None, remove_all: bool = False) -> Dict:
+
+def remove_qty(
+    port: Dict, *, symbol: str, qty: Optional[float] = None, remove_all: bool = False
+) -> Dict:
     """Remove quantity or delete the whole position with --all."""
     idx = _find_index_by_symbol(port, symbol)
     if idx == -1:
@@ -69,7 +82,10 @@ def remove_qty(port: Dict, *, symbol: str, qty: Optional[float] = None, remove_a
         pos["qty"] = new_qty
     return port
 
-def set_fields(port: Dict, *, symbol: str, qty: Optional[float] = None, cost_basis: Optional[float] = None) -> Dict:
+
+def set_fields(
+    port: Dict, *, symbol: str, qty: Optional[float] = None, cost_basis: Optional[float] = None
+) -> Dict:
     """Directly set qty and/or cost_basis on an existing position."""
     idx = _find_index_by_symbol(port, symbol)
     if idx == -1:
@@ -84,6 +100,7 @@ def set_fields(port: Dict, *, symbol: str, qty: Optional[float] = None, cost_bas
         port["positions"][idx]["cost_basis"] = float(cost_basis)
     return port
 
+
 def valuate(portfolio: Dict, prices: Dict, vs_currency: str) -> Dict:
     """Compute total and per-asset value + P/L."""
     total_value = 0.0
@@ -96,12 +113,14 @@ def valuate(portfolio: Dict, prices: Dict, vs_currency: str) -> Dict:
         value = qty * price
         pnl = value - (qty * cost)
         pnl_pct = (pnl / (qty * cost) * 100.0) if cost else 0.0
-        report.append({
-            "symbol": pos["symbol"],
-            "price": price,
-            "value": value,
-            "pnl": pnl,
-            "pnl_pct": pnl_pct
-        })
+        report.append(
+            {
+                "symbol": pos["symbol"],
+                "price": price,
+                "value": value,
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+            }
+        )
         total_value += value
     return {"positions": report, "total_value": total_value}

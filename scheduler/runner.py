@@ -4,19 +4,20 @@ import signal
 import time
 from typing import Callable
 
+from utils.lock import SingleInstanceLock
 from utils.logging import get_logger
 
-from utils.lock import SingleInstanceLock
-
-
 log = get_logger("scheduler")
+
 
 class _StopFlag:
     stop = False
 
+
 def _handle_sig(signum, frame):
     log.info("Received signal %s — stopping after current cycle.", signum)
     _StopFlag.stop = True
+
 
 def run_daemon(job_fn: Callable[[], None], interval_sec: int = 600, jitter_sec: int = 30):
     lock = SingleInstanceLock()
@@ -51,4 +52,3 @@ def run_daemon(job_fn: Callable[[], None], interval_sec: int = 600, jitter_sec: 
         log.info("Daemon stopped.")
     finally:
         lock.release()
-

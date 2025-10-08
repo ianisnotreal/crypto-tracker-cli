@@ -1,8 +1,10 @@
 # utils/lock.py
-import os, atexit
+import atexit
+import os
 
 LOCK_DIR = os.path.expanduser("~/.crypto_tracker")
 LOCK_PATH = os.path.join(LOCK_DIR, "daemon.lock")
+
 
 class SingleInstanceLock:
     def __init__(self, path: str = LOCK_PATH):

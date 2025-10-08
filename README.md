@@ -1,4 +1,4 @@
-# 💰 Crypto Tracker CLI
+# Crypto Tracker CLI
 
 [![CI](https://github.com/ianisnotreal/crypto-tracker-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/ianisnotreal/crypto-tracker-cli/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/crypto-tracker-cli.svg)](https://pypi.org/project/crypto-tracker-cli/)
@@ -10,7 +10,7 @@ A lightweight command-line application that tracks live cryptocurrency prices, p
 
 ---
 
-## 🚀 Features
+## Features
 
 ✅ Live crypto prices (via CoinGecko)  
 ✅ Portfolio tracking with P/L and % gain  
@@ -22,9 +22,11 @@ A lightweight command-line application that tracks live cryptocurrency prices, p
 ✅ JSON-based local storage (no database required)  
 ✅ Fully tested, linted, and CI/CD integrated
 
+If CoinGecko is unavailable, the CLI will attempt a best-effort HTML fallback (USD only) using Yahoo Finance for common symbols (BTC, ETH, SOL, DOGE, ADA). This is intended for short outages and may be incomplete.
+
 ---
 
-## ⚙️ Installation
+##  Installation
 
 ### From PyPI
 ```bash
