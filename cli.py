@@ -3,6 +3,7 @@ import argparse
 import time
 from statistics import mean, pstdev
 
+import services.coingecko_client as cg
 from core.portfolio import (
     load_portfolio,
     remove_qty,
@@ -12,20 +13,18 @@ from core.portfolio import (
     valuate,
 )
 from scheduler.runner import run_daemon
-from services.coingecko_client import get_prices
+from services.notify import send_webhook
 from storage.json_store import (
-    append_snapshot_line,
     ensure_config_exists,
-    read_alerts,
+    guarded_append_snapshot_line,
     read_cache,
     read_config,
+    read_daily_all,
     read_last_daily,
     read_last_snapshots,
     rebuild_daily_rollups,
-    write_alerts,
     write_cache,
     write_config,
-    read_daily_all,
 )
 from utils.logging import get_logger
 from utils.timeutils import utc_now_iso
@@ -87,7 +86,9 @@ def _snapshot_and_cache(ids, prices_resp, vs_currency, report):
         "positions": report["positions"],
         "vs_currency": vs_currency,
     }
-    append_snapshot_line(snapshot_obj)
+    saved = guarded_append_snapshot_line(snapshot_obj)
+    if not saved:
+        print("Warning: snapshot skipped as outlier (logged to snapshots_bad.jsonl).")
     flat_prices = {pid: prices_resp.get(pid, {}).get(vs_currency, 0.0) for pid in ids}
     write_cache(flat_prices, last_fetch_ts)
 
@@ -100,7 +101,7 @@ def one_cycle(vs_currency: str):
         return
 
     try:
-        prices_resp = get_prices(ids, vs_currency=vs_currency)
+        prices_resp = cg.get_prices(ids, vs_currency=vs_currency)
     except Exception as e:
         log.warning("Price fetch failed (%s). Falling back to cache.", e)
         cache = read_cache()
@@ -219,7 +220,7 @@ def cmd_price(args: argparse.Namespace):
     for s in syms:
         ids.append(_resolve_symbol_to_id(s, cfg))
 
-    prices = get_prices(ids, vs_currency=vs)
+    prices = cg.get_prices(ids, vs_currency=vs)
     # print results in symbol order
     for s, cid in zip(syms, ids):
         p = prices.get(cid, {}).get(vs, 0.0)
@@ -228,23 +229,28 @@ def cmd_price(args: argparse.Namespace):
 
 def cmd_history(args: argparse.Namespace):
     if args.daily:
-        # If a date filter is provided, we prefer full data then filter; else keep old --last behavior.
+        # If a date filter is provided, we prefer full data then filter.
+        # Otherwise keep the old --last behavior.
         if args.from_date or args.to_date:
             rows = _filter_daily_by_date(read_daily_all(), args.from_date, args.to_date)
             # If user still provided --last, apply it after filtering (tail)
             if args.last:
-                rows = rows[-args.last:]
+                rows = rows[-args.last :]
         else:
             rows = read_last_daily(args.last)
 
         if not rows:
-            print("No daily rollups in the requested range. Try `crypto rollup` or broaden your dates.")
+            print(
+                "No daily rollups in the requested range."
+                "Try `crypto rollup` or broaden your dates."
+            )
             return
 
         if args.table:
             try:
-                from rich.table import Table
                 from rich.console import Console
+                from rich.table import Table
+
                 t = Table(title=f"Daily rollups ({rows[0]['date']} → {rows[-1]['date']})")
                 t.add_column("Date", justify="left")
                 t.add_column("Open", justify="right")
@@ -458,111 +464,172 @@ def cmd_config(args: argparse.Namespace):
 
 
 def cmd_alert(args: argparse.Namespace):
-    cfg = read_config()
-    vs = (args.fiat or cfg.get("vs_currency", "usd")).lower()
+    import services.coingecko_client as cg  # ensure module import for test monkeypatch
 
-    # Load saved sets if requested
-    saved = read_alerts()  # {"saved": {...}}
-    above = {}
-    below = {}
+    cfg = read_config() or {}
+    default_webhook = str(cfg.get("webhook_url", "")).strip()
+    vs = (getattr(args, "fiat", None) or cfg.get("vs_currency", "usd")).lower()
 
-    if args.use:
-        name = args.use.lower()
-        preset = saved["saved"].get(name)
-        if not preset:
-            print(f"No saved alert set named '{name}'. Use `crypto alert --list` to see options.")
-            return
-        vs = (preset.get("vs_currency") or vs).lower()
-        above.update(preset.get("above") or {})
-        below.update(preset.get("below") or {})
+    # Built-in mapping so alerts work even without symbols_map in config
+    _builtin_map = {
+        "btc": "bitcoin",
+        "eth": "ethereum",
+        "ada": "cardano",
+        "sol": "solana",
+        "doge": "dogecoin",
+    }
+    symmap = cfg.get("symbols_map") or {}
 
-    # Merge inline thresholds (CLI args win)
-    above.update(_parse_symbol_thresholds(args.above))
-    below.update(_parse_symbol_thresholds(args.below))
+    def _cid(sym_key: str) -> str:
+        k = sym_key.lower()
+        return symmap.get(k, _builtin_map.get(k, k))
 
-    # List or delete saved sets and exit (no run)
-    if args.list:
-        names = sorted(saved["saved"].keys())
-        if not names:
-            print("No saved alert sets.")
-        else:
-            print("Saved alert sets:")
-            for n in names:
-                print(" -", n)
+    # parse thresholds like ["btc=70000", "eth=3000"]
+    def _parse_kv_numbers(items):
+        out = {}
+        for kv in items or []:
+            if "=" not in kv:
+                continue
+            k, v = kv.split("=", 1)
+            k = k.strip().lower()
+            try:
+                out[k] = float(v)
+            except Exception:
+                pass
+        return out
+
+    above = _parse_kv_numbers(getattr(args, "above", []))
+    below = _parse_kv_numbers(getattr(args, "below", []))
+
+    # IDs we need to fetch (map user symbols -> CoinGecko ids)
+    ids_needed = sorted({_cid(s) for s in set(above) | set(below)})
+    if not ids_needed:
+        print("No alerts specified. Use --above btc=70000 or --below eth=3000")
         return
 
-    if args.delete:
-        n = args.delete.lower()
-        if n in saved["saved"]:
-            del saved["saved"][n]
-            write_alerts(saved)
-            print(f"Deleted saved set '{n}'.")
-        else:
-            print(f"No saved set named '{n}'.")
+    def _run_once():
+        prices = cg.get_prices(ids_needed, vs)
+        hits = []
+
+        def _price_for(sym_key: str):
+            cid = _cid(sym_key)
+            p = prices.get(cid, {}).get(vs)
+            return sym_key.upper(), p
+
+        # >= alerts
+        for s, target in above.items():
+            sym, price = _price_for(s)
+            if price is not None and price >= target:
+                print(f"ALERT {sym:<5} ${price:,.2f}  (hit >= {target:,.2f})")
+                hits.append({"symbol": sym, "price": price, "cond": ">=", "target": target})
+
+        # <= alerts
+        for s, target in below.items():
+            sym, price = _price_for(s)
+            if price is not None and price <= target:
+                print(f"ALERT {sym:<5} ${price:,.2f}  (hit <= {target:,.2f})")
+                hits.append({"symbol": sym, "price": price, "cond": "<=", "target": target})
+
+        # webhook if any hits
+        if hits:
+            webhook = (getattr(args, "webhook", "") or default_webhook).strip()
+            if webhook:
+                lines = [
+                    f"ALERT {h['symbol']:<5} ${h['price']:,.2f}  "
+                    f"(hit {h['cond']} {h['target']:,.2f})"
+                    for h in hits
+                ]
+                text = "Crypto Tracker Alerts:\n" + "\n".join(lines)
+                ok = send_webhook(webhook, text)
+                if not ok:
+                    print("Warning: webhook post failed.")
+        return hits
+
+    # One-shot mode
+    if not getattr(args, "watch", False):
+        _run_once()
         return
 
-    # Must have at least one threshold to run or save
-    if not above and not below:
-        print("Provide thresholds with --above/--below or use --use <name>.")
-        return
+    # Watch mode: loop until a hit
+    import time
 
-    # Save current set if requested
-    if args.save:
-        name = args.save.lower()
-        saved["saved"][name] = {"vs_currency": vs, "above": above, "below": below}
-        write_alerts(saved)
-        print(f"Saved alert set '{name}'.")
-        # Note: keep running a check after saving
-
-    syms = sorted(set(list(above.keys()) + list(below.keys())))
-    ids = _resolve_many_symbols_to_ids(syms, cfg)
-
-    def check_once():
-        prices = get_prices(ids, vs_currency=vs)
-        triggered = []
-        for s, cid in zip(syms, ids):
-            p = float(prices.get(cid, {}).get(vs, 0.0))
-            if s in above and p >= above[s]:
-                triggered.append((s, p, f">= {above[s]:,.2f}"))
-            if s in below and p <= below[s]:
-                triggered.append((s, p, f"<= {below[s]:,.2f}"))
-        if triggered:
-            for s, p, cond in triggered:
-                print(f"\aALERT {s.upper():<5} ${p:,.2f}  (hit {cond})")
-        else:
-            print("No alerts triggered.")
-        return triggered
-
-    if args.every:
-        try:
-            import time
-
-            print(f"Watching every {args.every}s (Ctrl+C to stop). Fiat={vs.upper()}")
-            while True:
-                _ = check_once()
-                time.sleep(args.every)
-        except KeyboardInterrupt:
-            print("\nStopped.")
-    else:
-        check_once()
+    try:
+        while True:
+            if _run_once():
+                return
+            time.sleep(15)
+    except KeyboardInterrupt:
+        print("Stopped.")
 
 
 def cmd_watch(args: argparse.Namespace):
-    # Which coins to show?
+    # Config / basics
     cfg = read_config()
-    vs = (args.fiat or cfg.get("vs_currency", "usd")).lower()
+    vs = (getattr(args, "fiat", None) or cfg.get("vs_currency", "usd")).lower()
+    default_webhook = str(cfg.get("webhook_url", "")).strip()
 
-    # If user passed symbols, resolve them; else use portfolio coins.
-    syms = _parse_csv_syms(args.symbols)
-    if syms:
-        ids = _resolve_many_symbols_to_ids(syms, cfg)
-    else:
+    # Optional alert thresholds (only used if provided)
+    above = _parse_symbol_thresholds(getattr(args, "above", None))
+    below = _parse_symbol_thresholds(getattr(args, "below", None))
+    hits: list[dict] = []
+
+    # Which coins?
+    syms = _parse_csv_syms(getattr(args, "symbols", None))
+    if not syms:
         port = load_portfolio()
         syms = [p["symbol"].lower() for p in port.get("positions", [])]
-        ids = [p["id"] for p in port.get("positions", [])]
-        if not ids:
+        if not syms:
             print("No positions and no --symbols provided. Try: crypto watch --symbols btc,eth")
             return
+
+    # Resolve symbols -> CoinGecko ids
+    ids_map = _resolve_many_symbols_to_ids(syms, cfg)  # {sym: coingecko_id}
+    if not ids_map:
+        print("No symbols could be resolved.")
+        return
+
+    # Fetch prices once
+
+    price_map = cg.get_prices(list({v for v in ids_map.values() if v}), vs)  # {id: {vs: price}}
+
+    # Display + (optional) alerts
+    for sym in syms:
+        cid = ids_map.get(sym)
+        if not cid:
+            print(f"Skipping {sym}: no CoinGecko id")
+            continue
+
+        price = (price_map.get(cid) or {}).get(vs)
+        if price is None:
+            print(f"Skipping {sym}: no price for {vs}")
+            continue
+
+        # Normal watch output
+        print(f"{sym.upper():<6} ${price:,.6f}" if price < 1 else f"{sym.upper():<6} ${price:,.2f}")
+
+        # Optional alert checks (only if thresholds were provided)
+        tgt_above = above.get(sym)
+        if tgt_above is not None and price >= tgt_above:
+            print(f"ALERT {sym:<5} ${price:,.2f}  (hit >= {tgt_above:,.2f})")
+            hits.append({"symbol": sym.upper(), "price": price, "cond": ">=", "target": tgt_above})
+
+        tgt_below = below.get(sym)
+        if tgt_below is not None and price <= tgt_below:
+            print(f"ALERT {sym:<5} ${price:,.2f}  (hit <= {tgt_below:,.2f})")
+            hits.append({"symbol": sym.upper(), "price": price, "cond": "<=", "target": tgt_below})
+
+    # Send webhook if any hits
+    if hits:
+        lines = [
+            f"ALERT {h['symbol']:<5} ${h['price']:,.2f}  (hit {h['cond']} {h['target']:,.2f})"
+            for h in hits
+        ]
+        text = "Crypto Tracker Alerts:\n" + "\n".join(lines)
+        webhook = (getattr(args, "webhook", "") or default_webhook).strip()
+        if webhook:
+            ok = send_webhook(webhook, text)
+            if not ok:
+                print("Warning: webhook post failed.")
 
     # Optional alert thresholds
     above = _parse_symbol_thresholds(args.above)
@@ -593,7 +660,7 @@ def cmd_watch(args: argparse.Namespace):
 
         with Live(console=console, refresh_per_second=max(1, int(10 / args.every))):
             while True:
-                prices_resp = get_prices(ids, vs_currency=vs)
+                prices_resp = cg.get_prices(ids, vs_currency=vs)
                 flat = {cid: prices_resp.get(cid, {}).get(vs, 0.0) for cid in ids}
                 console.print(render_table(flat), justify="left")
                 time.sleep(args.every)
@@ -604,7 +671,7 @@ def cmd_watch(args: argparse.Namespace):
         )
         try:
             while True:
-                prices_resp = get_prices(ids, vs_currency=vs)
+                prices_resp = cg.get_prices(ids, vs_currency=vs)
                 for s, cid in zip(syms, ids):
                     p = prices_resp.get(cid, {}).get(vs, 0.0)
                     tag = ""
@@ -692,8 +759,7 @@ def cmd_stats(args: argparse.Namespace):
         print("Not enough daily data in the requested range. Try broadening --from/--to.")
         return
 
-    # (rest of your stats code unchanged: compute rets, sharpe, max drawdown, CAGR gating, optional CSV, print)
-
+    # compute stats, sharpe, max drawdown, CAGR, optional CSV, print
 
     # Ensure chronological order (read_last_daily returns tail in order)
     # So days[0] is earliest among the returned tail; fine to use directly.
@@ -853,16 +919,19 @@ def _cum_return_series(closes: list[float]) -> list[float]:
     base = closes[0]
     return [((c / base) - 1.0) * 100.0 for c in closes]
 
+
 from datetime import datetime
+
 
 def _parse_date_ymd(s: str | None) -> datetime | None:
     if not s:
         return None
     return datetime.strptime(s, "%Y-%m-%d")
 
+
 def _filter_daily_by_date(rows: list[dict], from_s: str | None, to_s: str | None) -> list[dict]:
     dfrom = _parse_date_ymd(from_s)
-    dto   = _parse_date_ymd(to_s)
+    dto = _parse_date_ymd(to_s)
     out = []
     for r in rows:
         try:
@@ -875,7 +944,6 @@ def _filter_daily_by_date(rows: list[dict], from_s: str | None, to_s: str | None
             continue
         out.append(r)
     return out
-
 
 
 # -------- Parser --------
@@ -925,7 +993,11 @@ def build_parser():
     p_hist = sub.add_parser("history", help="Show last N snapshots (or daily rollups)")
     p_hist.add_argument("--last", type=int, default=10, help="How many lines to show (default 10)")
     p_hist.add_argument("--table", action="store_true", help="Pretty table output")
-    p_hist.add_argument("--daily", action="store_true", help="Show daily rollups instead of raw snapshots")
+    p_hist.add_argument(
+        "--daily",
+        action="store_true",
+        help="Show daily (not raw) snapshots",
+    )
     p_hist.add_argument("--from", dest="from_date", help="Filter from date (YYYY-MM-DD)")
     p_hist.add_argument("--to", dest="to_date", help="Filter to date (YYYY-MM-DD)")
     p_hist.set_defaults(func=cmd_history)
@@ -967,6 +1039,13 @@ def build_parser():
     p_alert.add_argument("--use", help="Use a saved threshold set by name")
     p_alert.add_argument("--list", action="store_true", help="List saved alert sets")
     p_alert.add_argument("--delete", help="Delete a saved alert set by name")
+    p_alert.set_defaults(func=cmd_alert)
+
+    p_alert = sub.add_parser("alert", help="Check/watch price alerts")
+    p_alert.add_argument("--above", nargs="*", help="Alerts like btc=70000 eth=3000 ...")
+    p_alert.add_argument("--below", nargs="*", help="Alerts like btc=50000 ...")
+    p_alert.add_argument("--watch", action="store_true", help="Keep watching until triggered")
+    p_alert.add_argument("--webhook", help="Webhook URL (overrides config)")
     p_alert.set_defaults(func=cmd_alert)
 
     p_watch = sub.add_parser("watch", help="Live-updating price table")

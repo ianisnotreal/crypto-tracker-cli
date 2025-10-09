@@ -338,3 +338,125 @@ def read_daily_all() -> list[dict]:
     rows.sort(key=lambda r: r.get("date", ""))
     return rows
 
+# --- Outlier guard ---
+SNAPSHOTS_BAD_PATH = os.path.join(HOME_DIR, "snapshots_bad.jsonl")
+
+def _read_last_totals(n: int = 10) -> list[float]:
+    """Return last n total_value numbers from snapshots.jsonl (chronological tail)."""
+    ensure_home()
+    if not os.path.exists(SNAPSHOTS_PATH):
+        return []
+    rows = []
+    with open(SNAPSHOTS_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                rows.append(float(obj.get("total_value", 0.0)))
+            except Exception:
+                pass
+    return rows[-n:]
+
+def _median(vals: list[float]) -> float:
+    if not vals:
+        return 0.0
+    vals = sorted(vals)
+    m = len(vals) // 2
+    if len(vals) % 2:
+        return vals[m]
+    return (vals[m - 1] + vals[m]) / 2.0
+
+def _write_bad_snapshot(obj: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(SNAPSHOTS_BAD_PATH), exist_ok=True)
+        with open(SNAPSHOTS_BAD_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # never block caller
+
+def guarded_append_snapshot_line(
+    obj: dict,
+    window: int | None = None,
+    threshold: float | None = None,  # fraction 0..1 if provided
+) -> bool:
+    """
+    Append snapshot with an outlier guard.
+    Returns True if appended; False if skipped as outlier (logged to snapshots_bad.jsonl).
+    """
+    try:
+        total = float(obj.get("total_value", 0.0))
+    except Exception:
+        total = 0.0
+
+    # pick params (prefer explicit args; else config)
+    if window is None or threshold is None:
+        cfg_win, cfg_thr = _guard_params_from_config()
+        window = cfg_win if window is None else window
+        threshold = cfg_thr if threshold is None else threshold
+
+    ref = _read_last_totals(int(window))
+    if len(ref) < max(3, min(int(window), 10)):
+        append_snapshot_line(obj)
+        return True
+
+    med = _median(ref)
+    base = med if med > 0 else 1.0
+    deviation = abs(total - med) / base
+
+    if deviation > float(threshold):
+        _write_bad_snapshot({
+            "reason": "outlier_total_value",
+            "median": med,
+            "total_value": total,
+            "deviation": deviation,
+            "threshold": float(threshold),
+            "ts": obj.get("ts"),
+            "vs_currency": obj.get("vs_currency", "usd"),
+            "prices": obj.get("prices", {}),
+        })
+        return False
+
+    append_snapshot_line(obj)
+    return True
+
+    med = _median(ref)
+    base = med if med > 0 else 1.0
+    deviation = abs(total - med) / base  # e.g., 0.82 means 82% away from median
+
+    if deviation > threshold:
+        # Outlier — log to 'bad' file, skip normal append/rollup.
+        _write_bad_snapshot({
+            "reason": "outlier_total_value",
+            "median": med,
+            "total_value": total,
+            "deviation": deviation,
+            "threshold": threshold,
+            "ts": obj.get("ts"),
+            "vs_currency": obj.get("vs_currency", "usd"),
+            "prices": obj.get("prices", {}),
+        })
+        return False
+
+    # Normal path
+    append_snapshot_line(obj)
+    return True
+
+def _guard_params_from_config() -> tuple[int, float]:
+    """
+    Read guard window and threshold from config.json with safe defaults.
+    Returns: (window, threshold_fraction) where threshold_fraction is 0..1.
+    """
+    try:
+        cfg = read_config()
+        win = int(cfg.get("outlier_window", 10))
+        thr_pct = float(cfg.get("outlier_threshold_pct", 80.0))
+    except Exception:
+        win, thr_pct = 10, 80.0
+
+    # clamp to sane ranges
+    win = max(3, min(win, 1000))
+    thr = max(0.0, min(thr_pct / 100.0, 1.0))
+    return win, thr
+
